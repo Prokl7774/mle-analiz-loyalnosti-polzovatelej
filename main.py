@@ -44,3 +44,54 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+def drop_implicit_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    """Удаляет неявные дубликаты: одинаковый заказ под разными order_id."""
+    key = ["user_id", "order_ts", "device_type_canonical",
+           "service_name", "event_id", "revenue_rub"]
+    mask = df.duplicated(subset=key, keep=False)
+    print(f"Строк в неявных дублях: {mask.sum()} ({mask.mean() * 100:.2f}%)")
+
+    before = len(df)
+    df = df.drop_duplicates(subset=key, keep="first").copy()
+    print(f"Удалено повторов: {before - len(df)} ({(before - len(df)) / before * 100:.2f}%)")
+    return df
+
+
+def recompute_days_since_prev(df: pd.DataFrame) -> pd.DataFrame:
+    """Пересчитывает интервал между заказами после удаления дублей."""
+    df = df.sort_values(["user_id", "order_dt", "order_id"]).reset_index(drop=True)
+    df["days_since_prev"] = df.groupby("user_id")["order_dt"].diff().dt.days
+    print("NaN в days_since_prev:", df["days_since_prev"].isna().sum(),
+          "— это первые заказы пользователей (норма)")
+    return df
+
+
+def clean_revenue(df: pd.DataFrame) -> pd.DataFrame:
+    """Убирает неположительную выручку и выбросы выше 99-го перцентиля."""
+    q99 = df["revenue_rub"].quantile(0.99)
+    n_nonpos = (df["revenue_rub"] <= 0).sum()
+    n_tail = (df["revenue_rub"] > q99).sum()
+    n_before = len(df)
+
+    df = df[(df["revenue_rub"] > 0) & (df["revenue_rub"] <= q99)].copy()
+
+    print(f"99-й перцентиль revenue_rub: {q99:.2f} руб")
+    print(f"Удалено: неположительных {n_nonpos}, выбросов {n_tail} "
+          f"— {(n_nonpos + n_tail) / n_before * 100:.2f}% из {n_before} строк")
+    print("Осталось строк:", len(df))
+    return df
+def main() -> None:
+    df = pd.read_csv("data/afisha_orders_eda.csv", parse_dates=["order_dt"])
+    print(f"Загружено строк: {len(df)} | Колонок: {df.shape[1]}")
+
+    df = convert_revenue_to_rub(df)
+    df = drop_implicit_duplicates(df)
+    df = recompute_days_since_prev(df)
+    df = clean_revenue(df)
+
+    print(df.head())
+    print(df.dtypes)
+
+
+if __name__ == "__main__":
+    main()
