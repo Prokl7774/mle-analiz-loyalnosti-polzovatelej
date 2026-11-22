@@ -32,18 +32,6 @@ def convert_revenue_to_rub(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def main() -> None:
-    df = pd.read_csv("data/afisha_orders_eda.csv", parse_dates=["order_dt"])
-    print(f"Загружено строк: {len(df)} | Колонок: {df.shape[1]}")
-
-    df = convert_revenue_to_rub(df)
-
-    print(df.head())
-    print(df.dtypes)
-
-
-if __name__ == "__main__":
-    main()
 def drop_implicit_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     """Удаляет неявные дубликаты: одинаковый заказ под разными order_id."""
     key = ["user_id", "order_ts", "device_type_canonical",
@@ -80,6 +68,41 @@ def clean_revenue(df: pd.DataFrame) -> pd.DataFrame:
           f"— {(n_nonpos + n_tail) / n_before * 100:.2f}% из {n_before} строк")
     print("Осталось строк:", len(df))
     return df
+
+
+def drop_anomalous_users(df: pd.DataFrame) -> pd.DataFrame:
+    """Исключает пользователей с экстремальным числом заказов (выше 99-го перцентиля)."""
+    orders_per_user = df.groupby("user_id")["order_id"].count()
+    q99_orders = orders_per_user.quantile(0.99)
+    anomaly_mask = orders_per_user > q99_orders
+    print(f"99-й перцентиль числа заказов: {q99_orders:.0f}")
+    print(f"Пользователей выше порога: {anomaly_mask.sum()}")
+    print(f"({anomaly_mask.mean() * 100:.2f}%)")
+    print("Топ-5 значений orders_n у аномальных:",
+          sorted(orders_per_user[anomaly_mask].values, reverse=True)[:5])
+
+    n_users_before = df["user_id"].nunique()
+    df = df[~df["user_id"].isin(orders_per_user[anomaly_mask].index)].copy()
+    print(f"Исключено пользователей: {n_users_before - df['user_id'].nunique()}")
+    print(f"({(n_users_before - df['user_id'].nunique()) / n_users_before * 100:.2f}%)")
+    print("Осталось строк:", len(df))
+    return df
+
+
+def recompute_intervals_final(df: pd.DataFrame) -> pd.DataFrame:
+    """Финальный пересчёт интервалов после всех фильтров."""
+    df = df.sort_values(["user_id", "order_dt"]).reset_index(drop=True)
+    df["days_since_prev"] = df.groupby("user_id")["order_dt"].diff().dt.days
+
+    n_nan = df["days_since_prev"].isna().sum()
+    n_users = df["user_id"].nunique()
+    n_multi = (df.groupby("user_id").size() >= 2).sum()
+    print(f"NaN в days_since_prev: {n_nan} — равно числу пользователей: {n_users}")
+    print(f"Пользователей с 2+ оставшимися заказами: {n_multi} — "
+          f"столько же непустых интервалов")
+    return df
+
+
 def main() -> None:
     df = pd.read_csv("data/afisha_orders_eda.csv", parse_dates=["order_dt"])
     print(f"Загружено строк: {len(df)} | Колонок: {df.shape[1]}")
@@ -88,6 +111,8 @@ def main() -> None:
     df = drop_implicit_duplicates(df)
     df = recompute_days_since_prev(df)
     df = clean_revenue(df)
+    df = drop_anomalous_users(df)
+    df = recompute_intervals_final(df)
 
     print(df.head())
     print(df.dtypes)
@@ -95,3 +120,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
