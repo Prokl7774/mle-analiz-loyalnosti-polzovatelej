@@ -2,10 +2,12 @@
 Предобработка и анализ данных о заказах билетов.
 
 Класс DataProcessor закрывает требования задания:
-- загрузка данных и курса валют (курс за 100 тенге, по датам);
+- загрузка данных и курса валют (курс за номинал тенге, по датам);
 - конвертация тенге -> рубли по курсу на дату заказа;
-- очистка (дубликаты, некорректная выручка, хвост по p99, аномальные аккаунты);
-- профили пользователей и флаг возврата;
+- очистка по логике принятого исследования (неявные дубликаты по точному
+  времени, некорректная выручка, хвост по p99, аномальные аккаунты);
+- профили пользователей (первый заказ по точному времени с разрешением
+  совпадений по order_id) и флаг возврата;
 - retention по сегментам и когортам;
 - проверка гипотез (z-тест долей, хи-квадрат, Спирмен);
 - корреляционный анализ phi_k (глобальный и по сегментам).
@@ -74,7 +76,9 @@ class DataProcessor:
     # Сверены с реальными именами в data/orders.csv ---
     COL_USER = 'user_id'
     COL_ORDER = 'order_id'
-    COL_DT = 'order_dt'
+    COL_DT = 'order_dt'      # дата заказа
+    COL_TS = 'order_ts'      # точное время заказа (created_ts_msk)
+    COL_EVENT_ID = 'event_id'
     COL_EVENT_TYPE = 'event_type_main'
     COL_DEVICE = 'device_type_canonical'
     COL_REGION = 'region_name'
@@ -108,7 +112,7 @@ class DataProcessor:
         path = self.data_dir / 'orders.csv'
         if not path.exists():
             raise FileNotFoundError(f'Не найден файл данных: {path}')
-        df = pd.read_csv(path, parse_dates=[self.COL_DT])
+        df = pd.read_csv(path, parse_dates=[self.COL_DT, self.COL_TS])
         df = df[df[self.COL_DEVICE].isin(['mobile', 'desktop'])]
         df = df[df[self.COL_EVENT_TYPE] != 'фильм']
         return df.reset_index(drop=True)
@@ -119,28 +123,33 @@ class DataProcessor:
         cur = pd.read_csv(path, parse_dates=[self.CUR_DATE_COL])
         cur = cur[cur[self.CUR_CODE_COL].astype(str).str.lower()
                   == self.CUR_CODE_VALUE]
-        return cur.sort_values(self.CUR_DATE_COL)[
-            [self.CUR_DATE_COL, self.CUR_NOMINAL_COL, self.CUR_VALUE_COL]
-        ]
+        return cur[[self.CUR_DATE_COL, self.CUR_NOMINAL_COL, self.CUR_VALUE_COL]]
 
     # ==================== 2. Конвертация валюты ====================
 
     def convert_currency(self, df: pd.DataFrame) -> pd.DataFrame:
         """Тенге -> рубли по курсу на дату заказа.
 
-        merge_asof подбирает ближайший курс на дату заказа или раньше
-        (если на выходной курс не публикуется — берётся предыдущий).
+        Левый merge по нормализованной дате заказа — как в принятом
+        исследовании. Левый merge сохраняет порядок строк исходного
+        датафрейма, поэтому каждый заказ получает курс именно своей
+        даты; никакой сортировки и позиционной записи нет.
+        Если курс на дату заказа в файле отсутствует, rate остаётся
+        NaN — строка отфильтруется при очистке выручки.
         """
         rates = self.load_currency()
 
-        tmp = pd.DataFrame({'rate_date': df[self.COL_DT].dt.normalize()})
-        merged = pd.merge_asof(
-            tmp.sort_values('rate_date'), rates,
-            left_on='rate_date', right_on=self.CUR_DATE_COL,
-            direction='backward',
-        )
-        df['rate_curs'] = merged[self.CUR_VALUE_COL].values
-        df['rate_nominal'] = merged[self.CUR_NOMINAL_COL].values
+        df = df.copy()
+        df['_order_date'] = df[self.COL_DT].dt.normalize()
+        rates = rates.rename(columns={self.CUR_DATE_COL: '_order_date'})
+        df = df.merge(
+            rates[['_order_date', self.CUR_NOMINAL_COL, self.CUR_VALUE_COL]],
+            on='_order_date', how='left',
+        ).drop(columns=['_order_date'])
+        df = df.rename(columns={
+            self.CUR_VALUE_COL: 'rate_curs',
+            self.CUR_NOMINAL_COL: 'rate_nominal',
+        })
 
         df['revenue_rub'] = df[self.COL_REVENUE].astype(float)
         is_kzt = (df[self.COL_CURRENCY].astype(str).str.lower()
@@ -157,19 +166,22 @@ class DataProcessor:
     # ==================== 3. Очистка ====================
 
     def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Дубликаты -> некорректная выручка -> хвост по p99 -> аномальные аккаунты."""
+        """Неявные дубликаты -> некорректная выручка -> хвост p99 -> аномальные аккаунты."""
         n_raw = len(df)
 
-        # 3.1 Полные дубликаты: пользователь + время + устройство +
-        #     мероприятие + выручка (из доступных колонок)
-        subset = [self.COL_USER, self.COL_DT, self.COL_DEVICE,
-                  'operator_name', 'event_name', self.COL_REVENUE]
-        subset = [c for c in subset if c in df.columns]
+        # 3.1 Неявные дубликаты: одинаковый заказ под разными order_id.
+        # Ключ — как в принятом исследовании: точное время заказа
+        # (order_ts, не дата), пользователь, устройство, сервис,
+        # событие по event_id и выручка в рублях (после конвертации).
+        dedup_key = [self.COL_USER, self.COL_TS, self.COL_DEVICE,
+                     self.COL_SERVICE, self.COL_EVENT_ID, 'revenue_rub']
+        dedup_key = [c for c in dedup_key if c in df.columns]
         before = len(df)
-        df = df.drop_duplicates(subset=subset)
+        df = df.drop_duplicates(subset=dedup_key, keep='first')
         n_dupes = before - len(df)
 
-        # 3.2 Некорректная выручка: неположительная
+        # 3.2 Некорректная выручка: неположительная (включая строки
+        # без курса — revenue_rub = NaN не проходит фильтр > 0)
         before = len(df)
         df = df[df['revenue_rub'] > 0]
         n_bad = before - len(df)
@@ -209,8 +221,15 @@ class DataProcessor:
         total_rev = df.groupby(self.COL_USER)['revenue_rub'].sum().rename('total_revenue_rub')
         total_tix = df.groupby(self.COL_USER)[self.COL_TICKETS].sum().rename('total_tickets')
 
-        # Первый заказ: первая строка каждого пользователя по дате
-        first_idx = df.groupby(self.COL_USER)[self.COL_DT].idxmin()
+        # Первый заказ: минимальное точное время (order_ts);
+        # при совпадении метки времени у заказов одного пользователя
+        # порядок фиксируем по order_id — детерминизм, как в исследовании
+        first_idx = (
+            df.sort_values([self.COL_TS, self.COL_ORDER], kind='mergesort')
+              .groupby(self.COL_USER, sort=False)
+              .head(1)
+              .index
+        )
         first_feat = df.loc[first_idx, [
             self.COL_USER, self.COL_DEVICE, self.COL_EVENT_TYPE,
             self.COL_REGION, self.COL_SERVICE, self.COL_TICKETS,
@@ -310,7 +329,9 @@ class DataProcessor:
     def test_hypotheses(self, ret_event: pd.DataFrame) -> dict:
         p = self.profiles
         results = {}
-        # Г1: возврат по типу события различается? Спорт vs концерты
+        # Г1 (направленная): «после спорта возвращаются чаще».
+        # Тест двусторонний, поэтому фиксируем отдельно: значимо ли
+        # различие и в какую сторону оно направлено.
         sport = self._find_segment(ret_event, 'спорт')
         concerts = self._find_segment(ret_event, 'концерт')
         z, pv = self._z_test_two_proportions(
@@ -318,12 +339,16 @@ class DataProcessor:
             int(concerts['returned']), int(concerts['users']),
         )
         results['h1_sport_vs_concerts'] = {
-            'confirmed': pv < 0.05, 'z': round(z, 2), 'p_value': round(pv, 4),
-            'note': (f'спорт {sport["retention_pct"]}% vs концерты '
-                     f'{concerts["retention_pct"]}%'),
+            'diff_significant': bool(pv < 0.05),
+            'higher_return_after_sport': bool(
+                sport['retention_pct'] > concerts['retention_pct']
+            ),
+            'z': round(z, 2), 'p_value': round(pv, 4),
+            'note': (f'возврат после спорта {sport["retention_pct"]}% против '
+                     f'концертов {concerts["retention_pct"]}%'),
         }
 
-               # Г2: крупные регионы возвращают чаще? Топ-2 против остальных
+        # Г2: крупные регионы возвращают чаще? Топ-2 против остальных
         reg = p.groupby('region', observed=True).agg(
             users=('is_returned', 'size'), returned=('is_returned', 'sum'))
         reg['retention_pct'] = (reg['returned'] / reg['users'] * 100).round(1)
@@ -419,7 +444,7 @@ class DataProcessor:
         print('\n1. ДАННЫЕ И ПОДГОТОВКА')
         print(f"   Загружено строк: {s['n_raw_rows']:,}")
         print(f"   Конвертировано заказов из тенге: {s['n_currency_converted']:,}")
-        print(f"   Удалено дубликатов: {s['n_duplicates']}")
+        print(f"   Удалено неявных дубликатов: {s['n_duplicates']}")
         print(f"   Удалено строк с некорректной выручкой: {s['n_bad_revenue']}")
         print(f"   Хвост выручки (p99 = {s['revenue_p99']} руб): удалено {s['n_revenue_tail']} строк")
         print(f"   Аномальные аккаунты (порог {s['orders_p99']} заказов): исключено {s['n_anomaly_users']} пользователей")
